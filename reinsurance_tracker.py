@@ -16,7 +16,7 @@ import requests
 import feedparser
 import sqlite3
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import smtplib
 from email.mime.text import MIMEText
@@ -209,6 +209,9 @@ def init_database():
             keywords TEXT
         )
     ''')
+    columns = {row[1] for row in c.execute("PRAGMA table_info(updates)")}
+    if "sheets_exported_at" not in columns:
+        c.execute("ALTER TABLE updates ADD COLUMN sheets_exported_at TEXT")
     conn.commit()
     return conn
 
@@ -398,43 +401,80 @@ def fetch_rss_feeds(conn):
 # GOOGLE SHEETS
 # ============================================================================
 
-def append_to_google_sheet(updates):
-    """Append updates to Google Sheet for team viewing."""
-    if not SHEETS_ENABLED or not SHEETS_SPREADSHEET_ID or not gspread:
-        return
-    
+def load_google_credentials(value):
+    """Accept raw service-account JSON or its legacy base64 representation."""
     try:
-        creds_json_str = base64.b64decode(GOOGLE_CREDENTIALS_JSON).decode('utf-8')
-        creds_dict = json.loads(creds_json_str)
-        
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        
-        sheet = client.open_by_key(SHEETS_SPREADSHEET_ID)
-        worksheet = sheet.worksheet(SHEETS_WORKSHEET_NAME)
-        
-        rows_to_append = []
-        for update in updates:
-            row = [
-                datetime.now().strftime("%Y-%m-%d %H:%M UTC"),
-                update["source"],
-                update["title"],
-                update["url"],
-                ", ".join(update.get("keywords", [])),
-                update["date_published"],
-                "",
-            ]
-            rows_to_append.append(row)
-        
-        if rows_to_append:
-            worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-            print(f"✓ Google Sheet updated ({len(rows_to_append)} rows added)")
-    
-    except ImportError:
-        print("⚠️  gspread not installed. Skipping Google Sheets update.")
-    except Exception as e:
-        print(f"✗ Error updating Google Sheet: {e}")
+        value = value.strip().lstrip("\ufeff")
+        if not value.startswith("{"):
+            value = base64.b64decode("".join(value.split()), validate=True).decode("utf-8-sig")
+        info = json.loads(value)
+        required = ("client_email", "private_key", "token_uri")
+        if not isinstance(info, dict) or info.get("type") != "service_account" or not all(info.get(k) for k in required):
+            raise ValueError()
+        return info
+    except (ValueError, UnicodeError):
+        raise ValueError(
+            "GOOGLE_CREDENTIALS_JSON must contain complete service-account JSON "
+            "or its base64 encoding. Replace the repository Actions secret."
+        ) from None
+
+
+def pending_sheet_updates(conn):
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM updates WHERE sheets_exported_at IS NULL ORDER BY date_added, id"
+    ).fetchall()
+    return [dict(row, keywords=(row["keywords"] or "").split(",")) for row in rows]
+
+
+def append_to_google_sheet(updates, conn):
+    """Retry pending exports and reconcile URLs after partial/uncertain writes."""
+    if not SHEETS_ENABLED:
+        print("Google Sheets export disabled; updates remain pending.")
+        return
+    if not SHEETS_SPREADSHEET_ID or not gspread or not Credentials:
+        raise RuntimeError("Sheets export enabled but spreadsheet ID or dependencies are missing.")
+    info = load_google_credentials(GOOGLE_CREDENTIALS_JSON)
+    try:
+        creds = Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        worksheet = gspread.authorize(creds).open_by_key(
+            SHEETS_SPREADSHEET_ID
+        ).worksheet(SHEETS_WORKSHEET_NAME)
+        existing_urls = set(worksheet.col_values(4))
+        added = 0
+        for start in range(0, len(updates), 100):
+            batch = updates[start:start + 100]
+            rows = []
+            batch_urls = set(existing_urls)
+            for update in batch:
+                if not update["url"]:
+                    raise ValueError("Cannot export an update without a URL.")
+                if update["url"] not in batch_urls:
+                    rows.append([
+                        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                        update["source"], update["title"], update["url"],
+                        ", ".join(update.get("keywords", [])), update["date_published"], "",
+                    ])
+                    batch_urls.add(update["url"])
+            if rows:
+                worksheet.append_rows(rows, value_input_option="RAW")
+                added += len(rows)
+            # Mark only confirmed batches. On an uncertain write, the next run
+            # re-reads Sheet URLs before appending any pending rows.
+            conn.executemany("UPDATE updates SET sheets_exported_at = ? WHERE id = ?",
+                             [(datetime.now(timezone.utc).isoformat(), u["id"]) for u in batch])
+            conn.commit()
+            existing_urls = batch_urls
+        print(f"Google Sheet updated ({added} rows added; {len(updates)} pending items reconciled)")
+    except Exception:
+        # API errors may contain request data. Do not log credentials or payloads.
+        raise RuntimeError(
+            "Google Sheets export failed; unconfirmed items remain pending. "
+            "Check service-account JSON, Sheet ID, worksheet name and Editor access."
+        ) from None
+
 
 # ============================================================================
 # NOTIFICATIONS
@@ -551,13 +591,15 @@ def main():
     if all_updates:
         print(f"Found {len(all_updates)} new updates.\n")
         
-        append_to_google_sheet(all_updates)
         send_slack_notification(all_updates)
         send_email_notification(all_updates)
     else:
         print("No new updates found.\n")
     
-    conn.close()
+    try:
+        append_to_google_sheet(pending_sheet_updates(conn), conn)
+    finally:
+        conn.close()
     print("=" * 70)
     print("Run completed successfully.\n")
 

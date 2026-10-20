@@ -1,0 +1,5 @@
+*.db
+*.zip
+oct17-recovery/
+__pycache__/
+.venv/
