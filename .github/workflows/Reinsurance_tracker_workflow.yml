@@ -1,48 +1,86 @@
 name: Reinsurance Federal Updates Tracker
-
 on:
   schedule:
-    - cron: '0 8 * * *'
-  
+    - cron: '17 8 * * *' # UTC; off the busiest minute of the hour
   workflow_dispatch:
-
+    inputs:
+      export_only:
+        description: Retry saved updates without collection or notifications
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: tracker-production-state
+  cancel-in-progress: false
 jobs:
   track-updates:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 30
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-        cache: 'pip'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install requests feedparser gspread google-auth-oauthlib google-auth-httplib2 google-auth
-    
-    - name: Run tracker script
-      env:
-        CONGRESS_API_KEY: ${{ secrets.CONGRESS_API_KEY }}
-        SHEETS_ENABLED: ${{ secrets.SHEETS_ENABLED }}
-        SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
-        GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-        SLACK_ENABLED: ${{ secrets.SLACK_ENABLED }}
-        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-        EMAIL_ENABLED: ${{ secrets.EMAIL_ENABLED }}
-        EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-        EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-      run: python reinsurance_tracker.py
-    
-    - name: Upload database
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: reinsurance-updates-db
-        path: reinsurance_updates.db
-        retention-days: 90
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Restore most recent saved database (including failed exports)
+        id: restore
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+              ...context.repo, name: 'reinsurance-updates-db', per_page: 100
+            });
+            const candidates = artifacts.filter(a => !a.expired &&
+              a.workflow_run?.head_branch === context.payload.repository.default_branch &&
+              a.workflow_run?.head_repository_id === context.payload.repository.id)
+              .sort((a, b) => b.id - a.id);
+            let artifact;
+            for (const a of candidates) {
+              const {data: run} = await github.rest.actions.getWorkflowRun({
+                ...context.repo, run_id: a.workflow_run.id
+              });
+              if (run.path === '.github/workflows/Reinsurance_tracker_workflow.yml') {
+                artifact = a;
+                break;
+              }
+            }
+            if (!artifact) throw new Error('No saved database found. Restore a verified backup before running.');
+            const {data} = await github.rest.actions.downloadArtifact({
+              ...context.repo, artifact_id: artifact.id, archive_format: 'zip'
+            });
+            require('fs').writeFileSync('restored-state.zip', Buffer.from(data));
+            core.info(`Restoring database artifact ${artifact.id} from run ${artifact.workflow_run.id}`);
+      - name: Validate restored state
+        run: python restore_state.py restored-state.zip
+      - name: Run tracker script
+        env:
+          CONGRESS_API_KEY: ${{ secrets.CONGRESS_API_KEY }}
+          SHEETS_ENABLED: 'true'
+          SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          SLACK_ENABLED: ${{ secrets.SLACK_ENABLED }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          EMAIL_ENABLED: ${{ secrets.EMAIL_ENABLED }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EXPORT_ONLY: ${{ inputs.export_only }}
+        run: |
+          if [ "$EXPORT_ONLY" = "true" ]; then
+            python reinsurance_tracker.py --export-only
+          else
+            python reinsurance_tracker.py
+          fi
+      - name: Save database even if export fails
+        if: ${{ always() && steps.restore.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reinsurance-updates-db
+          path: reinsurance_updates.db
+          retention-days: 90
+          if-no-files-found: error
